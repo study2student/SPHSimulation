@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.1.32407.343
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SampleMotion", "SampleMotion.vcxproj", "{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Debug|x64.ActiveCfg = Debug|x64
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Debug|x64.Build.0 = Debug|x64
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Debug|x86.ActiveCfg = Debug|Win32
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Debug|x86.Build.0 = Debug|Win32
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Release|x64.ActiveCfg = Release|x64
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Release|x64.Build.0 = Release|x64
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Release|x86.ActiveCfg = Release|Win32
+		{F00D56AB-46BB-4155-BC2B-2B8976C2D0AF}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {D04B651C-B63C-456E-BFED-0B42E1DD5AFB}
+	EndGlobalSection
+EndGlobal
