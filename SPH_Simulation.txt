@@ -1,0 +1,442 @@
+#include "DxLib.h"
+#include <vector>
+#include <cmath>
+#include <algorithm>
+
+#undef min
+#undef max
+
+int screen_width = 480;  // 画面サイズを大きく変更
+int screen_height = 480;
+
+// Vector2D class to replace PVector
+class Vector2D {
+public:
+    float x, y;
+
+    Vector2D(float x = 0, float y = 0) : x(x), y(y) {}
+
+    Vector2D operator+(const Vector2D& other) const {
+        return Vector2D(x + other.x, y + other.y);
+    }
+
+    Vector2D operator-(const Vector2D& other) const {
+        return Vector2D(x - other.x, y - other.y);
+    }
+
+    Vector2D operator*(float scalar) const {
+        return Vector2D(x * scalar, y * scalar);
+    }
+
+    void operator+=(const Vector2D& other) {
+        x += other.x;
+        y += other.y;
+    }
+
+    void operator-=(const Vector2D& other) {
+        x -= other.x;
+        y -= other.y;
+    }
+
+    void operator*=(float scalar) {
+        x *= scalar;
+        y *= scalar;
+    }
+
+    void operator/=(float scalar) {
+        x /= scalar;
+        y /= scalar;
+    }
+
+    float magnitude() const {
+        return sqrt(x * x + y * y);
+    }
+
+    void normalize() {
+        float mag = magnitude();
+        if (mag > 0) {
+            x /= mag;
+            y /= mag;
+        }
+    }
+
+    Vector2D copy() const {
+        return Vector2D(x, y);
+    }
+
+    void mult(float scalar) {
+        x *= scalar;
+        y *= scalar;
+    }
+
+    void div(float scalar) {
+        x /= scalar;
+        y /= scalar;
+    }
+
+    void add(const Vector2D& other) {
+        x += other.x;
+        y += other.y;
+    }
+
+    void sub(const Vector2D& other) {
+        x -= other.x;
+        y -= other.y;
+    }
+
+    static Vector2D mult(const Vector2D& v, float scalar) {
+        return Vector2D(v.x * scalar, v.y * scalar);
+    }
+
+    static Vector2D sub(const Vector2D& a, const Vector2D& b) {
+        return Vector2D(a.x - b.x, a.y - b.y);
+    }
+};
+
+// Forward declarations
+class Particle;
+class Grid;
+class Field;
+
+// Field class
+class Field {
+public:
+    std::vector<Particle*> particles;
+
+    Field() {}
+
+    void clear() {
+        particles.clear();
+    }
+};
+
+// Grid class for spatial partitioning
+class Grid {
+public:
+    std::vector<Field> fields;
+    int n_width;
+    int n_height;
+    float h;
+
+    Grid(float wd, float ht, float h) : h(h) {
+        n_width = (int)ceil(wd / h);
+        n_height = (int)ceil(ht / h);
+        fields.resize(n_width * n_height);
+    }
+
+    Field* get_field(float x, float y) {
+        int i_width = (int)floor(x / h);
+        int i_height = (int)floor(y / h);
+        if (i_width >= 0 && i_width < n_width && i_height >= 0 && i_height < n_height) {
+            int index = i_width * n_height + i_height;
+            return &fields[index];
+        }
+        return nullptr;
+    }
+
+    void add_particle(Particle* p);
+
+    void clear_grid() {
+        for (auto& field : fields) {
+            field.clear();
+        }
+    }
+};
+
+// Particle class
+class Particle {
+public:
+    Vector2D pos;
+    Vector2D vel;
+    Vector2D pos_prev;
+    std::vector<Particle*> neighbors;
+    float rho;
+    float rho_near;
+    float pressure;
+    float pressure_near;
+    Vector2D dx;
+    bool rigid;
+
+    Particle(float x, float y, bool r) : pos(x, y), rigid(r) {
+        vel = Vector2D(0, 0);
+        rho = 0;
+        rho_near = 0;
+        dx = Vector2D(0, 0);
+    }
+
+    void plot() {
+        if (rigid) {
+            DrawCircle((int)pos.x, (int)pos.y, 4, GetColor(0, 0, 0), TRUE);
+        }
+        else {
+            int red = std::max(0, std::min(255, (int)(150 - pressure * 2000)));
+            int green = 255;
+            int blue = 200;
+            DrawCircle((int)pos.x, (int)pos.y, 4, GetColor(red, green, blue), TRUE);
+        }
+    }
+
+    void find_neighbors(Grid& g) {
+        Field* f = g.get_field(pos.x, pos.y);
+        if (f != nullptr) {
+            neighbors = f->particles;
+        }
+    }
+};
+
+// Implementation of Grid::add_particle (needs to be after Particle definition)
+void Grid::add_particle(Particle* p) {
+    for (int i = -1; i < 2; i++) {
+        for (int j = -1; j < 2; j++) {
+            float x = p->pos.x + h * (float)i;
+            float y = p->pos.y + h * (float)j;
+            Field* f = get_field(x, y);
+            if (f != nullptr) {
+                f->particles.push_back(p);
+            }
+        }
+    }
+}
+
+// Fluid class
+class Fluid {
+public:
+    std::vector<Particle> particles;
+    Vector2D g;
+    float dt;
+    float h; // kernel radius
+    float k;
+    float k_near;
+    float rho_0;
+    Grid grid;
+
+    Fluid(float dt, float h, int screen_width, int screen_height)
+        : dt(dt), h(h), grid(screen_width, screen_height, h) {
+        g = Vector2D(0, 0.01f);
+        g.mult(dt);
+        k = 0.008f;
+        k_near = 0.01f;
+        rho_0 = 10.0f;
+    }
+
+    void step() {
+        // Add gravity
+        for (auto& p : particles) {
+            if (!p.rigid) {
+                p.vel.add(g);
+            }
+        }
+
+        // Save previous position and advance to predicted position
+        for (auto& p : particles) {
+            p.pos_prev = p.pos.copy();
+            p.pos.add(Vector2D::mult(p.vel, dt));
+        }
+
+        // Double density relaxation
+        grid.clear_grid();
+        for (auto& p : particles) {
+            grid.add_particle(&p);
+        }
+
+        for (auto& p : particles) {
+            p.find_neighbors(grid);
+            p.rho = 0;
+            p.rho_near = 0;
+
+            // Compute density and near-density
+            for (auto* p_neighbor : p.neighbors) {
+                if (p_neighbor != &p) {
+                    Vector2D r_ij_vec = Vector2D::sub(p_neighbor->pos, p.pos);
+                    float r_ij = r_ij_vec.magnitude();
+                    float q = r_ij / h;
+                    if (q < 1) {
+                        float temp = 1 - q;
+                        float power_of_temp = temp * temp;
+                        p.rho += power_of_temp;
+                        power_of_temp *= temp;
+                        p.rho_near += power_of_temp;
+                    }
+                }
+            }
+
+            // Compute pressure and near-pressure
+            p.pressure = k * (p.rho - rho_0);
+            p.pressure_near = k_near * p.rho_near;
+
+            p.dx.mult(0);
+            for (auto* p_neighbor : p.neighbors) {
+                Vector2D r_ij_vec = Vector2D::sub(p_neighbor->pos, p.pos);
+                float r_ij = r_ij_vec.magnitude();
+                float q = r_ij / h;
+                if (q < 1) {
+                    r_ij_vec.normalize();
+                    Vector2D D = r_ij_vec;
+                    D.mult(dt * dt * (p.pressure * (1 - q) + p.pressure_near * (1 - q) * (1 - q)));
+                    D.mult(0.5f);
+                    if (!p_neighbor->rigid) {
+                        p_neighbor->pos.add(D);
+                    }
+                    p.dx.sub(D);
+                }
+            }
+            if (!p.rigid) {
+                p.pos.add(p.dx);
+            }
+        }
+
+        // Resolve collisions with boundaries
+        for (auto& p : particles) {
+            if (p.pos.x < 0) p.pos.x = 0;
+            if (p.pos.x > screen_width) p.pos.x = screen_width;
+            if (p.pos.y < 0) p.pos.y = 0;
+            if (p.pos.y > screen_height) p.pos.y = screen_height;
+        }
+
+        // Compute new velocity
+        for (auto& p : particles) {
+            p.vel = Vector2D::sub(p.pos, p.pos_prev);
+            p.vel.div(dt);
+        }
+    }
+
+    void plot() {
+        for (auto& p : particles) {
+            p.plot();
+        }
+    }
+};
+
+// Global variables
+Fluid* fluid;
+float kernel_radius = 20.0f;
+float timestep = 2.0f;
+int model = 2; // 1-3 for different models
+float stepsPerFrame = 1.0f;
+
+
+void createBorders() {
+    for (float x = 0; x < screen_width; x += kernel_radius * 0.1f) {
+        fluid->particles.emplace_back(x, screen_height, true);
+    }
+    for (float y = 0; y < screen_height; y += kernel_radius * 0.1f) {
+        fluid->particles.emplace_back(0, y, true);
+        fluid->particles.emplace_back(screen_width, y, true);
+    }
+}
+
+void setupFluid() {
+    fluid = new Fluid(timestep, kernel_radius, screen_width, screen_height);
+
+    // Model 1: drop in zero gravity
+    if (model == 1) {
+        stepsPerFrame = 2;
+        timestep = 2;
+        fluid->g = Vector2D(0, 0); // deactivate gravity
+        for (float x = screen_width * 0.4f; x < (screen_width * 0.6f); x += kernel_radius * 0.25f) {
+            for (float y = screen_height * 0.2f; y < (screen_height * 0.8f); y += kernel_radius * 0.25f) {
+                fluid->particles.emplace_back(x, y, false);
+            }
+        }
+    }
+
+    // Model 2: dam break
+    if (model == 2) {
+        stepsPerFrame = 2;
+        timestep = 1;
+        for (float x = screen_width * 0.1f; x < screen_width * 0.3f; x += kernel_radius * 0.25f) {
+            for (float y = screen_height * 0.2f; y < (screen_height * 0.8f); y += kernel_radius * 0.25f) {
+                fluid->particles.emplace_back(x, y, false);
+            }
+        }
+        createBorders();
+    }
+
+    // Model 3: tube to fill
+    if (model == 3) {
+        stepsPerFrame = 1;
+        timestep = 1;
+        for (float x = screen_width * 0.25f; x < screen_width * 0.45f; x += kernel_radius * 0.25f) {
+            for (float y = screen_height * 0.5f; y < (screen_height * 0.9f); y += kernel_radius * 0.25f) {
+                fluid->particles.emplace_back(x, y, false);
+            }
+        }
+        createBorders();
+        for (float y = screen_height / 2; y < screen_height; y += kernel_radius * 0.1f) {
+            fluid->particles.emplace_back(screen_width * 0.2f, y, true);
+            fluid->particles.emplace_back(screen_width * 0.2f + kernel_radius * 0.1f, y, true);
+            fluid->particles.emplace_back(screen_width * 0.5f, y, true);
+            fluid->particles.emplace_back(screen_width * 0.5f + kernel_radius * 0.1f, y, true);
+        }
+    }
+}
+
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+   SetGraphMode(screen_width, screen_height, 32);
+   ChangeWindowMode(TRUE);
+   SetWindowText("SPH Fluid Simulation");
+
+   if (DxLib_Init() == -1) {
+       return -1;
+   }
+
+   SetDrawScreen(DX_SCREEN_BACK);
+
+   setupFluid();
+
+   // メインループ
+   while (ProcessMessage() == 0 && CheckHitKey(KEY_INPUT_ESCAPE) == 0) {
+       ClearDrawScreen();
+
+       // マウスクリックで粒子を追加
+       if (GetMouseInput() & MOUSE_INPUT_LEFT) {
+           int mouseX, mouseY;
+           GetMousePoint(&mouseX, &mouseY);
+           for (int i = 1; i < 5; i++) {
+               float randX = (float)(rand() % (int)kernel_radius) - kernel_radius / 2;
+               float randY = (float)(rand() % (int)kernel_radius) - kernel_radius / 2;
+               fluid->particles.emplace_back(mouseX + randX, mouseY + randY, false);
+           }
+       }
+
+       // Update simulation
+       for (int i = 0; i < (int)stepsPerFrame; i++) {
+           fluid->step();
+       }
+
+       // 粒子の描画
+       fluid->plot();
+
+       // Display particle count
+       DrawFormatString(10, 10, GetColor(255, 255, 255), "Particles: %d", fluid->particles.size());
+       DrawFormatString(10, 30, GetColor(255, 255, 255), "Model: %d (Press 1-3 to switch)", model);
+       DrawFormatString(10, 50, GetColor(255, 255, 255), "Click to add particles");
+
+       // Check for model switching
+       if (CheckHitKey(KEY_INPUT_1)) {
+           model = 1;
+           delete fluid;
+           setupFluid();
+       }
+       if (CheckHitKey(KEY_INPUT_2)) {
+           model = 2;
+           delete fluid;
+           setupFluid();
+       }
+       if (CheckHitKey(KEY_INPUT_3)) {
+           model = 3;
+           delete fluid;
+           setupFluid();
+       }
+
+       DrawFormatString(10, 70, GetColor(255, 255, 255), "FPS: %.01f", GetFPS());
+
+       ScreenFlip();
+   }
+
+   // Cleanup
+   delete fluid;
+   DxLib_End();
+   return 0;
+}

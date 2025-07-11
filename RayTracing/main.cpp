@@ -1,4 +1,5 @@
 #include "DxLib.h"
+#include <mutex>
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -14,6 +15,142 @@
 const int SCREEN_WIDTH = 800;
 const int SCREEN_HEIGHT = 600;
 const int PARTICLE_COLOR = GetColor(64, 164, 255);
+
+
+// スレッド使用状況を視覚化するためのクラス
+class ThreadVisualizer {
+private:
+    struct ThreadInfo {
+        int threadId;
+        bool isActive;
+        int64_t lastActiveTime;
+        std::string currentTask;
+    };
+
+    std::vector<ThreadInfo> threadInfos;
+    int maxThreads;
+    std::mutex infoMutex;
+    bool isEnabled;
+
+    // 追加する変数
+	std::atomic<int> activeThreadsCount;// スレッド数をアトミックに管理
+
+public:
+    ThreadVisualizer() : isEnabled(true), activeThreadsCount(1) {
+        maxThreads = omp_get_max_threads();
+        threadInfos.resize(maxThreads);
+
+        for (int i = 0; i < maxThreads; i++) {
+            threadInfos[i].threadId = i;
+            threadInfos[i].isActive = false;
+            threadInfos[i].lastActiveTime = GetTickCount64();
+            threadInfos[i].currentTask = "Idle";
+        }
+    }
+
+    // 並列領域内からスレッド数を更新するメソッド
+    void updateThreadCount() {
+        if (!isEnabled) return;
+
+        // 並列領域内でのみ正確なスレッド数を取得できる
+#pragma omp single
+        {
+            activeThreadsCount = omp_get_num_threads();
+        }
+
+    }
+
+    void setActive(const std::string& taskName) {
+        if (!isEnabled) return;
+
+        int threadId = omp_get_thread_num();
+
+        std::lock_guard<std::mutex> lock(infoMutex);
+        if (threadId >= 0 && threadId < maxThreads) {
+            threadInfos[threadId].isActive = true;
+            threadInfos[threadId].lastActiveTime = GetTickCount64();
+            threadInfos[threadId].currentTask = taskName;
+        }
+    }
+
+    void setInactive() {
+        if (!isEnabled) return;
+
+        int threadId = omp_get_thread_num();
+
+        std::lock_guard<std::mutex> lock(infoMutex);
+        if (threadId >= 0 && threadId < maxThreads) {
+            threadInfos[threadId].isActive = false;
+        }
+    }
+
+    void draw(int x, int y) {
+        if (!isEnabled) return;
+
+        int avtiveThreads = 0;
+        // activeThreadsCountから取得したスレッド数を使う
+		int currentThreads = activeThreadsCount.load();
+
+        std::lock_guard<std::mutex> lock(infoMutex);
+
+        // スレッド数情報の表示
+        DrawFormatString(x, y, GetColor(255, 255, 255), "Active Threads: %d / %d", currentThreads, maxThreads);
+
+        // 各スレッドの状態を可視化
+        int boxSize = 15;
+        int margin = 2;
+        int64_t currentTime = GetTickCount64();
+
+        for (int i = 0; i < maxThreads; i++) {
+            int drawX = x + i * (boxSize + margin);
+            int drawY = y + 20;
+
+            // アクティブかどうかで色を変更
+            int color;
+
+            if (threadInfos[i].isActive) {
+                color = GetColor(0, 255, 0); // 緑
+                avtiveThreads++;
+            }
+            else {
+                // 最近アクティブだったスレッド：黄色、それ以外：赤
+                int64_t timeSinceActive = currentTime - threadInfos[i].lastActiveTime;
+                if (timeSinceActive < 1000) {
+                    color = GetColor(255, 255, 0); // 黄色
+                }
+                else {
+                    color = GetColor(255, 0, 0); // 赤
+                }
+            }
+
+            // スレッド状態を表す四角形を描画
+            DrawBox(drawX, drawY, drawX + boxSize, drawY + boxSize, color, TRUE);
+
+            // スレッドIDを表示
+            DrawFormatString(drawX + 3, drawY + 2, GetColor(0, 0, 0), "%d", i);
+        }
+
+        // アクティブスレッド数を表示
+        DrawFormatString(x, y + 40, GetColor(255, 255, 255), "Active: %d", avtiveThreads);
+
+        // タスク情報(最初の3つのスレッドだけ表示)
+        for (int i = 0; i < std::min(3, maxThreads); i++) {
+            std::string taskInfo = "Thread " + std::to_string(i) + ": " + threadInfos[i].currentTask;
+            if (taskInfo.length() > 30) {
+                taskInfo = taskInfo.substr(0, 27) + "...";
+            }
+            DrawFormatString(x, y + 60 + i * 20, GetColor(200, 200, 200), "%s", taskInfo.c_str());
+        }
+    }
+
+    void enable(bool enable) {
+        isEnabled = enable;
+    }
+
+};
+
+// グローバルインスタンス
+ThreadVisualizer g_ThreadVisualizer; // 定義を追加
 
 // 2Dベクトルクラス
 struct Vec2 {
@@ -80,7 +217,7 @@ public:
 
     std::vector<int> getNeighbors(const Vec2& position, float radius) {
         std::vector<int> neighbors;
-        neighbors.reserve(60); // より多くの近傍粒子を予め確保
+        neighbors.reserve(120); // より多くの近傍粒子を予め確保
 
         int x0 = static_cast<int>(std::floor((position.x - radius) / cellSize));
         int y0 = static_cast<int>(std::floor((position.y - radius) / cellSize));
@@ -322,28 +459,36 @@ public:
         }
 
         // 各粒子の近傍情報を計算
-#pragma omp parallel for
-        for (int i = 0; i < static_cast<int>(particles.size()); i++) {
-            Particle& pi = particles[i];
-            auto& neighbors = neighborCache[i];
-            neighbors.clear();
+#pragma omp parallel
+        {
+            // スレッド数を更新(並列領域内で実行)
+			g_ThreadVisualizer.updateThreadCount();
 
-            // 近傍粒子を取得
-            auto neighborIndices = spatialHash.getNeighbors(pi.position, smoothingRadius);
+            #pragma omp for
+            for (int i = 0; i < static_cast<int>(particles.size()); i++) {
+                g_ThreadVisualizer.setActive("Computing neighbors");
 
-            for (int j : neighborIndices) {
-                Particle& pj = particles[j];
-                Vec2 rij = pi.position - pj.position;
-                float r2 = rij.squaredLength();
+                Particle& pi = particles[i];
+                auto& neighbors = neighborCache[i];
+                neighbors.clear();
 
-                if (r2 < smoothingRadius * smoothingRadius && i != j) {
-                    float r = std::sqrt(r2);
-                    neighbors.emplace_back(j, r);
+                // 近傍粒子を取得
+                auto neighborIndices = spatialHash.getNeighbors(pi.position, smoothingRadius);
+
+                for (int j : neighborIndices) {
+                    Particle& pj = particles[j];
+                    Vec2 rij = pi.position - pj.position;
+                    float r2 = rij.squaredLength();
+
+                    if (r2 < smoothingRadius * smoothingRadius && i != j) {
+                        float r = std::sqrt(r2);
+                        neighbors.emplace_back(j, r);
+                    }
                 }
+                g_ThreadVisualizer.setInactive();
             }
         }
     }
-
     // シミュレーションのメインステップ
     void update() {
         // 適応的タイムステップの計算
@@ -407,163 +552,199 @@ public:
 
     // 密度と圧力の計算（改良版：密度フィルタリング）
     void computeDensityPressure() {
-#pragma omp parallel for
-        for (int i = 0; i < static_cast<int>(particles.size()); i++) {
-            Particle& pi = particles[i];
-            float newDensity = 0.0f;
+    #pragma omp parallel
+        {
+            g_ThreadVisualizer.updateThreadCount();
 
-            // 自分自身の寄与
-            newDensity += massPerParticle * kernelPoly6(0, smoothingRadius);
+            #pragma omp for
+            for (int i = 0; i < static_cast<int>(particles.size()); i++) {
+                g_ThreadVisualizer.setActive("Computing desity");
 
-            // 近傍粒子の寄与
-            for (const auto& [j, r] : neighborCache[i]) {
-                if (i == j) continue;
-                newDensity += massPerParticle * kernelPoly6(r, smoothingRadius);
+                Particle& pi = particles[i];
+                float newDensity = 0.0f;
+
+                // 自分自身の寄与
+                newDensity += massPerParticle * kernelPoly6(0, smoothingRadius);
+
+                // 近傍粒子の寄与
+                for (const auto& [j, r] : neighborCache[i]) {
+                    if (i == j) continue;
+                    newDensity += massPerParticle * kernelPoly6(r, smoothingRadius);
+                }
+
+                // 密度の時間フィルタリング
+                if (pi.previousDensity > 0) {
+                    pi.density = (1.0f - densityFilterCoeff) * pi.previousDensity + densityFilterCoeff * newDensity;
+                }
+                else {
+                    pi.density = newDensity;
+                }
+                pi.previousDensity = pi.density;
+
+                // 改良版圧力計算（Tait方程式）
+                const float gamma = 7.0f;  // 気体定数に相当
+                const float B = pressureCoeff * restDensity / gamma;
+
+                float ratio = pi.density / restDensity;
+                pi.pressure = B * (std::pow(ratio, gamma) - 1.0f);
+                pi.pressure = std::max(0.0f, pi.pressure); // 負の圧力を防止
+
+                g_ThreadVisualizer.setInactive();
             }
-
-            // 密度の時間フィルタリング
-            if (pi.previousDensity > 0) {
-                pi.density = (1.0f - densityFilterCoeff) * pi.previousDensity + densityFilterCoeff * newDensity;
-            }
-            else {
-                pi.density = newDensity;
-            }
-            pi.previousDensity = pi.density;
-
-            // 改良版圧力計算（Tait方程式）
-            const float gamma = 7.0f;  // 気体定数に相当
-            const float B = pressureCoeff * restDensity / gamma;
-
-            float ratio = pi.density / restDensity;
-            pi.pressure = B * (std::pow(ratio, gamma) - 1.0f);
-            pi.pressure = std::max(0.0f, pi.pressure); // 負の圧力を防止
         }
     }
 
     // 表面張力と渦度の計算
     void computeSurfaceTensionAndVorticity() {
-#pragma omp parallel for
-        for (int i = 0; i < static_cast<int>(particles.size()); i++) {
-            Particle& pi = particles[i];
+#pragma omp parallel
+        {
+            g_ThreadVisualizer.updateThreadCount();
 
-            // 表面法線の計算
-            Vec2 normal(0, 0);
-            float colorGradientSum = 0.0f;
+            #pragma omp for
+            for (int i = 0; i < static_cast<int>(particles.size()); i++) {
+                g_ThreadVisualizer.setActive("Computing surface");
 
-            for (const auto& [j, r] : neighborCache[i]) {
-                if (i == j || r < 1e-6f) continue;
+                Particle& pi = particles[i];
 
-                Particle& pj = particles[j];
-                Vec2 rij = pi.position - pj.position;
-                Vec2 gradW = rij * (1.0f / r) * kernelSpikyGradient(r, smoothingRadius);
-                normal += gradW * (massPerParticle / pj.density);
-                colorGradientSum += gradW.length();
-            }
+                // 表面法線の計算
+                Vec2 normal(0, 0);
+                float colorGradientSum = 0.0f;
 
-            // 表面張力の計算（表面曲率に比例）
-            float surfaceStrength = normal.length();
-            if (surfaceStrength > 0.1f) {  // 表面粒子の判定しきい値
-                // 表面張力の影響は表面粒子のみに適用
-                pi.surfaceTension = surfaceTensionCoeff * colorGradientSum;
-            }
-            else {
-                pi.surfaceTension = 0.0f;
-            }
+                for (const auto& [j, r] : neighborCache[i]) {
+                    if (i == j || r < 1e-6f) continue;
 
-            // 渦度の計算
-            Vec2 curl(0, 0);
-            for (const auto& [j, r] : neighborCache[i]) {
-                if (i == j) continue;
-
-                Particle& pj = particles[j];
-                Vec2 rij = pi.position - pj.position;
-                Vec2 vij = pj.velocity - pi.velocity;
-
-                if (r > 1e-6f) {
+                    Particle& pj = particles[j];
+                    Vec2 rij = pi.position - pj.position;
                     Vec2 gradW = rij * (1.0f / r) * kernelSpikyGradient(r, smoothingRadius);
-                    curl.x += (vij.y * gradW.x - vij.x * gradW.y);
-                    curl.y += (vij.x * gradW.y - vij.y * gradW.x);
+                    normal += gradW * (massPerParticle / pj.density);
+                    colorGradientSum += gradW.length();
                 }
-            }
 
-            pi.vorticityStrength = vorticityCoeff * curl.length();
+                // 表面張力の計算（表面曲率に比例）
+                float surfaceStrength = normal.length();
+                if (surfaceStrength > 0.1f) {  // 表面粒子の判定しきい値
+                    // 表面張力の影響は表面粒子のみに適用
+                    pi.surfaceTension = surfaceTensionCoeff * colorGradientSum;
+                }
+                else {
+                    pi.surfaceTension = 0.0f;
+                }
+
+                // 渦度の計算
+                Vec2 curl(0, 0);
+                for (const auto& [j, r] : neighborCache[i]) {
+                    if (i == j) continue;
+
+                    Particle& pj = particles[j];
+                    Vec2 rij = pi.position - pj.position;
+                    Vec2 vij = pj.velocity - pi.velocity;
+
+                    if (r > 1e-6f) {
+                        Vec2 gradW = rij * (1.0f / r) * kernelSpikyGradient(r, smoothingRadius);
+                        curl.x += (vij.y * gradW.x - vij.x * gradW.y);
+                        curl.y += (vij.x * gradW.y - vij.y * gradW.x);
+                    }
+                }
+
+                pi.vorticityStrength = vorticityCoeff * curl.length();
+
+                g_ThreadVisualizer.setInactive();
+            }
         }
     }
 
     // 力の計算（改良版：表面張力と渦度を追加）
     void computeForces() {
-#pragma omp parallel for
-        for (int i = 0; i < static_cast<int>(particles.size()); i++) {
-            Particle& pi = particles[i];
-            // 重力
-            pi.force = Vec2(0, gravityY * pi.density);
+#pragma omp parallel
+        {
+            g_ThreadVisualizer.updateThreadCount();
 
-            // 境界力
-            pi.force += calculateBoundaryForce(pi.position, boundaryRadius);
+            #pragma omp for
+            for (int i = 0; i < static_cast<int>(particles.size()); i++) {
+                g_ThreadVisualizer.setActive("Computing forces");
 
-            // 粒子間力
-            for (const auto& [j, r] : neighborCache[i]) {
-                if (i == j) continue;
+                Particle& pi = particles[i];
+                // 重力
+                pi.force = Vec2(0, gravityY * pi.density);
 
-                Particle& pj = particles[j];
-                Vec2 rij = pi.position - pj.position;
+                // 境界力
+                pi.force += calculateBoundaryForce(pi.position, boundaryRadius);
 
-                // 非常に近い場合は単位ベクトルを調整
-                Vec2 rijNorm = (r > 1e-6f) ? rij * (1.0f / r) : Vec2(0, 1);
+                // 粒子間力
+                for (const auto& [j, r] : neighborCache[i]) {
+                    if (i == j) continue;
 
-                // 圧力項（改良版：両方の圧力を使用）
-                float pressureTerm = -massPerParticle * (pi.pressure / (pi.density * pi.density) +
-                    pj.pressure / (pj.density * pj.density));
-                Vec2 pressureForce = rijNorm * pressureTerm * kernelSpikyGradient(r, smoothingRadius);
-                pi.force += pressureForce;
+                    Particle& pj = particles[j];
+                    Vec2 rij = pi.position - pj.position;
 
-                // 粘性項
-                Vec2 vij = pj.velocity - pi.velocity;
-                float viscosityTerm = viscosityCoeff * massPerParticle / pj.density;
-                Vec2 viscosityForce = vij * viscosityTerm * kernelViscosityLaplacian(r, smoothingRadius);
-                pi.force += viscosityForce;
+                    // 非常に近い場合は単位ベクトルを調整
+                    Vec2 rijNorm = (r > 1e-6f) ? rij * (1.0f / r) : Vec2(0, 1);
 
-                // 表面張力項
-                if (pi.surfaceTension > 0) {
-                    Vec2 surfaceForce = rijNorm * pi.surfaceTension * kernelPoly6(r, smoothingRadius);
-                    pi.force += surfaceForce;
+                    // 圧力項（改良版：両方の圧力を使用）
+                    float pressureTerm = -massPerParticle * (pi.pressure / (pi.density * pi.density) +
+                        pj.pressure / (pj.density * pj.density));
+                    Vec2 pressureForce = rijNorm * pressureTerm * kernelSpikyGradient(r, smoothingRadius);
+                    pi.force += pressureForce;
+
+                    // 粘性項
+                    Vec2 vij = pj.velocity - pi.velocity;
+                    float viscosityTerm = viscosityCoeff * massPerParticle / pj.density;
+                    Vec2 viscosityForce = vij * viscosityTerm * kernelViscosityLaplacian(r, smoothingRadius);
+                    pi.force += viscosityForce;
+
+                    // 表面張力項
+                    if (pi.surfaceTension > 0) {
+                        Vec2 surfaceForce = rijNorm * pi.surfaceTension * kernelPoly6(r, smoothingRadius);
+                        pi.force += surfaceForce;
+                    }
+
+                    // 渦度項（渦を強化）
+                    if (pi.vorticityStrength > 0) {
+                        // 渦度に比例した力を加える（ランダムな方向）
+                        float angle = static_cast<float>(rand()) / RAND_MAX * 2.0f * 3.14159f;
+                        Vec2 vortexForce(std::cos(angle), std::sin(angle));
+                        pi.force += vortexForce * pi.vorticityStrength * 0.01f;
+                    }
+
+                    // XSPH修正（速度の分散を低減）
+                    float xsphWeight = xsphCoeff * massPerParticle * kernelPoly6(r, smoothingRadius) / pj.density;
+                    pi.velocity += vij * xsphWeight;
+
+                    g_ThreadVisualizer.setInactive();
                 }
-
-                // 渦度項（渦を強化）
-                if (pi.vorticityStrength > 0) {
-                    // 渦度に比例した力を加える（ランダムな方向）
-                    float angle = static_cast<float>(rand()) / RAND_MAX * 2.0f * 3.14159f;
-                    Vec2 vortexForce(std::cos(angle), std::sin(angle));
-                    pi.force += vortexForce * pi.vorticityStrength * 0.01f;
-                }
-
-                // XSPH修正（速度の分散を低減）
-                float xsphWeight = xsphCoeff * massPerParticle * kernelPoly6(r, smoothingRadius) / pj.density;
-                pi.velocity += vij * xsphWeight;
             }
         }
     }
 
     // Velocity Verlet法による積分（より高精度）
     void integrateVerlet(float dt) {
-#pragma omp parallel for
-        for (int i = 0; i < static_cast<int>(particles.size()); i++) {
-            Particle& p = particles[i];
+#pragma omp parallel
+        {
+            g_ThreadVisualizer.updateThreadCount();
 
-            // 加速度 = 力 / 質量
-            Vec2 acceleration = p.force * (1.0f / p.density);
+            #pragma omp for
+            for (int i = 0; i < static_cast<int>(particles.size()); i++) {
+                g_ThreadVisualizer.setActive("Computing intergration");
 
-            // 速度の半ステップ更新
-            Vec2 halfVelocity = p.velocity + acceleration * (dt * 0.5f);
+                Particle& p = particles[i];
 
-            // 位置を更新
-            p.position += halfVelocity * dt;
+                // 加速度 = 力 / 質量
+                Vec2 acceleration = p.force * (1.0f / p.density);
 
-            // 境界処理
-            processBoundaryConditions(p);
+                // 速度の半ステップ更新
+                Vec2 halfVelocity = p.velocity + acceleration * (dt * 0.5f);
 
-            // 最終的な速度更新
-            p.velocity = halfVelocity + acceleration * (dt * 0.5f);
+                // 位置を更新
+                p.position += halfVelocity * dt;
+
+                // 境界処理
+                processBoundaryConditions(p);
+
+                // 最終的な速度更新
+                p.velocity = halfVelocity + acceleration * (dt * 0.5f);
+
+                g_ThreadVisualizer.setInactive();
+            }
         }
     }
 
@@ -572,22 +753,22 @@ public:
         // 左側境界
         if (p.position.x < minX) {
             p.position.x = minX + (minX - p.position.x) * 0.5f;
-            p.velocity.x = -p.velocity.x * std::exp(-boundaryDampingCoeff * fabs(p.velocity.x));
+            p.velocity.x = -p.velocity.x * std::exp(-boundaryDampingCoeff * /*fabs*/(p.velocity.x));
         }
         // 右側境界
         if (p.position.x > maxX) {
             p.position.x = maxX - (p.position.x - maxX) * 0.5f;
-            p.velocity.x = -p.velocity.x * std::exp(-boundaryDampingCoeff * fabs(p.velocity.x));
+            p.velocity.x = -p.velocity.x * std::exp(-boundaryDampingCoeff * /*fabs*/(p.velocity.x));
         }
         // 下側境界
         if (p.position.y < minY) {
             p.position.y = minY + (minY - p.position.y) * 0.5f;
-            p.velocity.y = -p.velocity.y * std::exp(-boundaryDampingCoeff * fabs(p.velocity.y));
+            p.velocity.y = -p.velocity.y * std::exp(-boundaryDampingCoeff * /*fabs*/(p.velocity.y));
         }
         // 上側境界
         if (p.position.y > maxY) {
             p.position.y = maxY - (p.position.y - maxY) * 0.5f;
-            p.velocity.y = -p.velocity.y * std::exp(-boundaryDampingCoeff * fabs(p.velocity.y));
+            p.velocity.y = -p.velocity.y * std::exp(-boundaryDampingCoeff * /*fabs*/(p.velocity.y));
         }
     }
 
@@ -681,6 +862,9 @@ public:
         DrawFormatString(10, 10, GetColor(255, 255, 255), "FPS: %.1f", avgFPS);
         DrawFormatString(10, 30, GetColor(255, 255, 255), "Particles: %d", particles.size());
         DrawFormatString(10, 50, GetColor(255, 255, 255), "Timestep: %.4f", currentTimestep);
+
+        // スレッド数使用状況の可視化
+        g_ThreadVisualizer.draw(10, 90);
     }
 
     // マウス位置に粒子を追加
@@ -784,7 +968,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     SetDrawScreen(DX_SCREEN_BACK);
 
     // OpenMPの初期化
-    omp_set_num_threads(std::max(1, omp_get_max_threads()));
+    int maxThreads = omp_get_max_threads();
+	int numThreads = std::max(4, maxThreads); // 最小4スレッド
+	omp_set_num_threads(numThreads);
+    
+    // スレッド情報を表示
+	printf("Max threads available: %d, Using threads: %d\n", maxThreads, numThreads);
 
     // シミュレータの作成
     ImprovedSPHFluidSimulator simulator;
